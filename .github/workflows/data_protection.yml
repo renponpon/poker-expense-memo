@@ -1,0 +1,87 @@
+name: Data Protection & Maintenance
+
+on:
+  schedule:
+    - cron: '0 0 * * *'        # 毎日午前9時 (JST)
+    - cron: '0 0 */45 * *'     # 45日ごとに実行（GitHub Actions停止防止）
+  workflow_dispatch:          # 手動実行用
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1. Supabase Keep-alive (7日間ルール対策)
+      - name: Supabase Keep-alive
+        run: |
+          curl -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/heartbeat?id=eq.1" \
+          -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+          -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+          -H "Content-Type: application/json" \
+          -H "Prefer: resolution=merge-duplicates" \
+          -d '{"id": 1, "last_ping": "now()", "status": "active"}'
+
+      # 2. Database Backup (SQL形式)
+      - name: Database Backup
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }} # DBパスワードが必要
+        run: |
+          mkdir -p backups
+          # 注意: SUPABASE_DB_URL は postgres://postgres:[password]@db.[project-ref].supabase.co:5432/postgres の形式
+          # ホスト名などは secrets から動的に構築するか、直接 URL を使用
+          pg_dump "${{ secrets.SUPABASE_DB_URL }}" > backups/db_backup.sql
+
+      # 3. Commit & Push Backups
+      - name: Commit & Push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add backups/db_backup.sql
+          git commit -m "Auto-backup: $(date +'%Y-%m-%d %H:%M:%S')" || exit 0
+          git push
+
+      # 4. GitHub Actions Persistence (空コミットによる停止回避)
+      - name: Keep Workflow Active
+        if: github.event.schedule == '0 0 */45 * *'
+        run: |
+          git commit --allow-empty -m "Persistence Commit: Keeping workflow alive"
+          git push
+
+      # 5. Error Notification (Gmail)
+      - name: Send Notification on Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "【要確認】ポーカー経費アプリの自動守衛がトラブルを検知しました"
+          to: ${{ secrets.MAIL_DESTINATION }}
+          from: "Poker Tax Guard"
+          body: |
+            アプリ所有者様
+            
+            ポーカー経費管理アプリの自動データ保護ジョブでエラーが発生しました。
+            
+            1. 何が起きたか:
+            データのバックアップ、または Supabase の生存確認に失敗しました。
+            Supabase プロジェクトが停止している、または API 設定に問題がある可能性があります。
+            
+            2. 放置した際のリスク:
+            このまま90日間放置すると、Supabase の仕様により、過去の経費データがすべて消えてしまう恐れがあります。
+            
+            3. 今すぐすべき対策:
+            手順1: Supabaseのダッシュボード (https://supabase.com/dashboard/) にログインし「Restore Project」ボタンがあるか確認してください。
+            手順2: ボタンがあればクリックして復旧させてください。
+            手順3: それでも解決しない場合は、GitHub の Actions 実行ログを確認してください:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            ※このメールは自動送信されています。
